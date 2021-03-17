@@ -112,6 +112,8 @@ static int32_t get_simulated_sensor(int32_t current_value, int32_t max_step,
 							 bool increase);
 static void sensor_timer_callback(TimerHandle_t pxTimer);
 static void publish_humidity(void *ctx);
+static void publish_power(void *ctx);
+
 
 
 /*******************************************************************************
@@ -150,6 +152,7 @@ TimerHandle_t xTimerSensor;
 uint32_t humidity_sensor = 50;
 uint32_t samples_cnt = 0;
 bool sprinklers_on;
+bool power_status;
 
 
 /*******************************************************************************
@@ -159,7 +162,7 @@ bool sprinklers_on;
 /*!
  * @brief Called when subscription request finishes.
  */
-static void mqtt_topic_subscribed_cb(void *arg, err_t err)
+ static void mqtt_topic_subscribed_cb(void *arg, err_t err)
 {
     const char *topic = (const char *)arg;
 
@@ -343,6 +346,21 @@ static void publish_humidity(void *ctx)
     mqtt_publish(mqtt_client, topic, message, strlen(message), 1, 0, mqtt_message_published_cb, (void *)topic);
 }
 
+static void publish_power(void *ctx)
+{
+    static const char *topic   = "lglezcas/feeds/indicator";
+    static char message[10];
+
+    LWIP_UNUSED_ARG(ctx);
+
+    memset(message, 0, 10);
+    sprintf(message, "%d", power_status);
+
+    PRINTF("Going to publish to the topic \"%s\"...\r\n", topic);
+
+    mqtt_publish(mqtt_client, topic, message, strlen(message), 1, 0, mqtt_message_published_cb, (void *)topic);
+}
+
 /*!
  * @brief Application thread.
  */
@@ -461,10 +479,17 @@ static void app_thread(void *arg)
 		else if(uxBits & MQTT_SPRINKLERS_EVT ) {
 			PRINTF("MQTT_SPRINKLERS_EVT.\r\n");
 			if(sprinklers_on){
+				power_status = true;
 				GPIO_PortClear(BOARD_LED_GPIO, 1u << BOARD_LED_GPIO_PIN);
 			}
 			else {
+				power_status = false;
 				GPIO_PortSet(BOARD_LED_GPIO, 1u << BOARD_LED_GPIO_PIN);
+			}
+			err = tcpip_callback(publish_power, NULL);
+			if (err != ERR_OK)
+			{
+				PRINTF("Failed to invoke publish_power on the tcpip_thread: %d.\r\n", err);
 			}
 		}
 		else if(uxBits & MQTT_DISCONNECTED_EVT ) {
