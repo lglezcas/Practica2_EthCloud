@@ -82,7 +82,7 @@
 #define EXAMPLE_MQTT_SERVER_HOST "io.adafruit.com"
 
 #define EXAMPLE_MQTT_USER "lglezcas"
-#define EXAMPLE_MQTT_PSWD "aio_VCXa97eaIHb4XW6L8bGqo7YAJyKF"
+#define EXAMPLE_MQTT_PSWD "aio_DBZo63AUmARFZbsVVcKt53FBs7ZT"
 
 /*! @brief MQTT server port number. */
 #define EXAMPLE_MQTT_SERVER_PORT 1883
@@ -95,9 +95,10 @@
 #define APP_THREAD_PRIO DEFAULT_THREAD_PRIO
 
 #define MQTT_CONNECTED_EVT		( 1 << 0 )
-#define MQTT_SENSOR_EVT			( 1 << 1 )
-#define MQTT_SPRINKLERS_EVT		( 1 << 2 )
-#define MQTT_DISCONNECTED_EVT	( 1 << 3 )
+#define MQTT_POWER_EVT			( 1 << 1 )
+#define MQTT_LEVEL_EVT			( 1 << 2 )
+#define MQTT_GRAPH_EVT			( 1 << 3 )
+#define MQTT_DISCONNECTED_EVT	( 1 << 4 )
 
 #define BOARD_LED_GPIO BOARD_LED_RED_GPIO
 #define BOARD_LED_GPIO_PIN BOARD_LED_RED_GPIO_PIN
@@ -110,8 +111,9 @@ static void connect_to_mqtt(void *ctx);
 static int32_t get_simulated_sensor(int32_t current_value, int32_t max_step,
 		                     int32_t min_value, int32_t max_value,
 							 bool increase);
-static void sensor_timer_callback(TimerHandle_t pxTimer);
-static void publish_humidity(void *ctx);
+static void graph_timer_callback(TimerHandle_t pxTimer);
+static void publish_level(void *ctx);
+static void publish_graph(void *ctx);
 static void publish_power(void *ctx);
 
 
@@ -147,12 +149,12 @@ static volatile bool connected = false;
 // Declare a variable to hold the created event group.
 EventGroupHandle_t xEventGroup;
 
-TimerHandle_t xTimerSensor;
+TimerHandle_t xTimerGraph;
 
 uint32_t humidity_sensor = 50;
 uint32_t samples_cnt = 0;
-bool sprinklers_on;
 bool power_status;
+char MB_Received[10] = {0};
 
 
 /*******************************************************************************
@@ -209,12 +211,39 @@ static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t f
     }
 
     if(!memcmp(data, "ON", 2)) {
-    	sprinklers_on = true;
-    	xEventGroupSetBits(xEventGroup,	MQTT_SPRINKLERS_EVT);
+    	power_status = true;
+    	xEventGroupSetBits(xEventGroup,	MQTT_POWER_EVT);
     }
     else if(!memcmp(data, "OFF", 3)) {
-    	sprinklers_on = false;
-    	xEventGroupSetBits(xEventGroup,	MQTT_SPRINKLERS_EVT);
+    	power_status = false;
+    	xEventGroupSetBits(xEventGroup,	MQTT_POWER_EVT);
+    }
+    else
+    {
+    	if(len == 1)
+    	{
+        	MB_Received[0] = (char)data[0];
+        	MB_Received[1] = 0;
+        	MB_Received[2] = 0;
+    	}
+    	else if(len == 2)
+    	{
+        	MB_Received[0] = (char)data[0];
+        	MB_Received[1] = (char)data[1];
+        	MB_Received[2] = 0;
+    	}
+    	else if(len == 3)
+    	{
+        	MB_Received[0] = (char)data[0];
+        	MB_Received[1] = (char)data[1];
+        	MB_Received[2] = (char)data[2];
+    	}
+    	else
+    	{
+    		/*Nothing to do*/
+    	}
+
+    	xEventGroupSetBits(xEventGroup,	MQTT_LEVEL_EVT);
     }
 
     if (flags & MQTT_DATA_FLAG_LAST)
@@ -331,19 +360,26 @@ static void mqtt_message_published_cb(void *arg, err_t err)
 /*!
  * @brief Publishes a message. To be called on tcpip_thread.
  */
-static void publish_humidity(void *ctx)
+static void publish_level(void *ctx)
 {
     static const char *topic   = "lglezcas/feeds/monitor_view";
-    static char message[10];
 
     LWIP_UNUSED_ARG(ctx);
 
-    memset(message, 0, 10);
-    sprintf(message, "%d", humidity_sensor);
+    PRINTF("Going to publish to the topic \"%s\"...\r\n", topic);
+
+    mqtt_publish(mqtt_client, topic, MB_Received, strlen(MB_Received), 1, 0, mqtt_message_published_cb, (void *)topic);
+}
+
+static void publish_graph(void *ctx)
+{
+    static const char *topic   = "lglezcas/feeds/graph";
+
+    LWIP_UNUSED_ARG(ctx);
 
     PRINTF("Going to publish to the topic \"%s\"...\r\n", topic);
 
-    mqtt_publish(mqtt_client, topic, message, strlen(message), 1, 0, mqtt_message_published_cb, (void *)topic);
+    mqtt_publish(mqtt_client, topic, MB_Received, strlen(MB_Received), 1, 0, mqtt_message_published_cb, (void *)topic);
 }
 
 static void publish_power(void *ctx)
@@ -385,8 +421,8 @@ static void app_thread(void *arg)
     	PRINTF("Error creating the events group\r\n");
     }
 
-    xTimerSensor = xTimerCreate("TimerSns", 1000 / portTICK_PERIOD_MS, pdTRUE, (void*)&timerId, sensor_timer_callback);
-    if( xTimerSensor == NULL ) {
+    xTimerGraph = xTimerCreate("TimerSns", 60000 / portTICK_PERIOD_MS, pdTRUE, (void*)&timerId, graph_timer_callback);
+    if( xTimerGraph == NULL ) {
     	PRINTF("Error creating the sensors timer\r\n");
     }
 
@@ -451,7 +487,7 @@ static void app_thread(void *arg)
 		// the event group.  Clear the bits before exiting.
 		uxBits = xEventGroupWaitBits(
 					xEventGroup,	// The event group being tested.
-					MQTT_CONNECTED_EVT | MQTT_SENSOR_EVT | MQTT_SPRINKLERS_EVT | MQTT_DISCONNECTED_EVT,	// The bits within the event group to wait for.
+					MQTT_CONNECTED_EVT | MQTT_POWER_EVT | MQTT_LEVEL_EVT | MQTT_GRAPH_EVT | MQTT_DISCONNECTED_EVT,	// The bits within the event group to wait for.
 					pdTRUE,			// BIT_0 and BIT_4 should be cleared before returning.
 					pdFALSE,		// Don't wait for both bits, either bit will do.
 					xTicksToWait );	// Wait a maximum of 100ms for either bit to be set.
@@ -460,36 +496,42 @@ static void app_thread(void *arg)
 
 		if(uxBits & MQTT_CONNECTED_EVT ) {
 			PRINTF("MQTT_CONNECTED_EVT.\r\n");
-			//Start the sensor timer
-			xTimerStart(xTimerSensor, 0);
+			//Start the graph timer
+			xTimerStart(xTimerGraph, 0);
 		}
-		else if(uxBits & MQTT_SENSOR_EVT ) {
-			PRINTF("MQTT_SENSOR_EVT.\r\n");
-			// Simulate the humidity %, in steps of 5, range is 10% to 100%.
-			// If the sprinkler is On, the humidity will tent to rise.
-			humidity_sensor = get_simulated_sensor(humidity_sensor, 2, 10, 100, sprinklers_on);
-			if((samples_cnt++%10) == 9){
-				err = tcpip_callback(publish_humidity, NULL);
-				if (err != ERR_OK)
-				{
-					PRINTF("Failed to invoke publish_humidity on the tcpip_thread: %d.\r\n", err);
-				}
-			}
-		}
-		else if(uxBits & MQTT_SPRINKLERS_EVT ) {
-			PRINTF("MQTT_SPRINKLERS_EVT.\r\n");
-			if(sprinklers_on){
-				power_status = true;
+		else if(uxBits & MQTT_POWER_EVT ) {
+			PRINTF("MQTT_POWER_EVT.\r\n");
+			if(power_status){
 				GPIO_PortClear(BOARD_LED_GPIO, 1u << BOARD_LED_GPIO_PIN);
 			}
 			else {
-				power_status = false;
 				GPIO_PortSet(BOARD_LED_GPIO, 1u << BOARD_LED_GPIO_PIN);
 			}
 			err = tcpip_callback(publish_power, NULL);
 			if (err != ERR_OK)
 			{
 				PRINTF("Failed to invoke publish_power on the tcpip_thread: %d.\r\n", err);
+			}
+		}
+		else if(power_status)
+		{
+			if(uxBits & MQTT_LEVEL_EVT ) {
+				PRINTF("MQTT_LEVEL_EVT.\r\n");
+
+				err = tcpip_callback(publish_level, NULL);
+				if (err != ERR_OK)
+				{
+					PRINTF("Failed to invoke publish_humidity on the tcpip_thread: %d.\r\n", err);
+				}
+			}
+			else if(uxBits & MQTT_GRAPH_EVT ) {
+				PRINTF("MQTT_GRAPH_EVT.\r\n");
+
+				err = tcpip_callback(publish_graph, NULL);
+				if (err != ERR_OK)
+				{
+					PRINTF("Failed to invoke publish_humidity on the tcpip_thread: %d.\r\n", err);
+				}
 			}
 		}
 		else if(uxBits & MQTT_DISCONNECTED_EVT ) {
@@ -590,9 +632,9 @@ int32_t get_simulated_sensor(int32_t current_value, int32_t max_step, int32_t mi
 	return current_value;
 }
 
-void sensor_timer_callback( TimerHandle_t pxTimer )
+void graph_timer_callback( TimerHandle_t pxTimer )
 {
-	xEventGroupSetBits(xEventGroup,	MQTT_SENSOR_EVT);
+	xEventGroupSetBits(xEventGroup,	MQTT_GRAPH_EVT);
 }
 
 #endif
